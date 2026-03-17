@@ -99,6 +99,7 @@ class FullAttentionSpec(AttentionSpec):
     """
 
     head_size_v: int = None  # type: ignore[assignment]
+    cache_dtype_str: str | None = None
 
     sliding_window: int | None = None
     """
@@ -160,6 +161,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -179,6 +181,22 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4":
+            # Packed layout per head: fp4 data + fp8 block scales.
+            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
+            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
+            last_dim = (
+                self.head_size // 2
+                + self.head_size // 16
+                + self.head_size_v // 2
+                + self.head_size_v // 16
+            )
+            return (
+                self.block_size
+                * self.num_kv_heads
+                * last_dim
+                * get_dtype_size(self.dtype)
+            )
         return (
             self.block_size
             * self.num_kv_heads
