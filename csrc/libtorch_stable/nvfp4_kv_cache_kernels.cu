@@ -302,6 +302,223 @@ __global__ void reshape_and_cache_nvfp4_kernel(
   }
 }
 
+// Kernel: quantize bf16/half MLA latent KV to NVFP4 + FP8-E4M3 and store in
+// the page-segmented MLA NVFP4 KV cache ("Option B" layout).
+//
+// Per page (block_size tokens), with nope_dim = kv_lora_rank (512) and
+// pe_dim (64), all offsets in bytes relative to the page base:
+//   token t data record at t * token_data_bytes, where
+//     token_data_bytes = nope_dim / 2 + pe_dim (= 320):
+//       [nope_dim/2 bytes packed FP4 of quantized kv_c |
+//        pe_dim bytes FP8-E4M3 of k_pe]
+//   token t scale factors at block_size * token_data_bytes + t * sf_dim,
+//     where sf_dim = nope_dim / 16 (= 32):
+//       sf_dim E4M3 scale factors for the NoPE groups, LINEAR layout
+//       (sf s at byte +s). Unlike the MHA writer above, there is
+//       explicitly NO swizzle: the MLA kernels expect linear SFs.
+//
+// Quantization contract (cache stores x / k_scale):
+//   NoPE: NVFP4 quantization of kv_c with global scale 1/k_scale
+//         (same math as cvt_warp_fp16_to_fp4 in the MHA kernel).
+//   RoPE: direct E4M3 cast of k_pe / k_scale, no scale factors.
+//
+// Threading: one CUDA block per token (like concat_and_cache_mla).
+// Groups of THREADS_PER_SF threads each quantize one 16-element NoPE
+// group; all threads then stride over the RoPE elements.
+template <typename scalar_t>
+__global__ void concat_and_cache_mla_nvfp4_kernel(
+    const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
+    uint8_t* __restrict__ kv_cache,     // [num_blocks, block_size, full_dim]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const float* __restrict__ scale_ptr,       // pointer to checkpoint k_scale
+    const int64_t kv_c_stride,                 // kv_c.stride(0) in elements
+    const int64_t k_pe_stride,                 // k_pe.stride(0) in elements
+    const int64_t block_stride,                // kv_cache.stride(0) in bytes
+    const int kv_lora_rank,                    //
+    const int pe_dim,                          //
+    const int block_size                       //
+) {
+  using CudaType = typename CUDATypeConverter<scalar_t>::Type;
+  using PVec = PackedVec<CudaType, CVT_FP4_PACK16>;
+
+  static constexpr int ELTS = CVT_FP4_ELTS_PER_THREAD;  // 16 or 8
+  static constexpr int THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / ELTS;
+
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int block_offset = static_cast<int>(slot_idx % block_size);
+
+  // Option-B page-segmented layout offsets (bytes).
+  const int token_data_bytes = kv_lora_rank / 2 + pe_dim;  // 320
+  const int sf_dim = kv_lora_rank / CVT_FP4_SF_VEC_SIZE;   // 32
+
+  uint8_t* __restrict__ page_base = kv_cache + block_idx * block_stride;
+  uint8_t* __restrict__ data_dst =
+      page_base + static_cast<int64_t>(block_offset) * token_data_bytes;
+  uint8_t* __restrict__ rope_dst = data_dst + kv_lora_rank / 2;
+  uint8_t* __restrict__ sf_dst =
+      page_base + static_cast<int64_t>(block_size) * token_data_bytes +
+      static_cast<int64_t>(block_offset) * sf_dim;
+
+  const float global_scale = 1.0f / *scale_ptr;  // = 1 / k_scale
+
+  const CudaType* __restrict__ nope_src =
+      reinterpret_cast<const CudaType*>(kv_c) + token_idx * kv_c_stride;
+  const CudaType* __restrict__ rope_src =
+      reinterpret_cast<const CudaType*>(k_pe) + token_idx * k_pe_stride;
+
+  const int tid = threadIdx.x;
+  const int num_thread_groups = blockDim.x / THREADS_PER_SF;
+  const int tg_id = tid / THREADS_PER_SF;
+  const int tg_lane = tid % THREADS_PER_SF;
+
+  const int total_groups = kv_lora_rank / CVT_FP4_SF_VEC_SIZE;  // 32
+
+  for (int g = tg_id; g < total_groups; g += num_thread_groups) {
+    // Load 16 (or 8) bf16/half elements from kv_c
+    PVec in_vec;
+    const CudaType* __restrict__ src_ptr =
+        nope_src + g * CVT_FP4_SF_VEC_SIZE + tg_lane * ELTS;
+
+#pragma unroll
+    for (int i = 0; i < ELTS / 2; i++) {
+      in_vec.elts[i] =
+          reinterpret_cast<const typename PackedTypeConverter<CudaType>::Type*>(
+              src_ptr)[i];
+    }
+
+    // Quantize: produces packed fp4 and writes the block scale factor.
+    uint8_t sf_val;
+    uint8_t* sf_out_ptr = (tg_lane == 0) ? &sf_val : nullptr;
+
+    fp4_packed_t packed = cvt_warp_fp16_to_fp4<CudaType, THREADS_PER_SF>(
+        in_vec, global_scale, sf_out_ptr);
+
+    // Write packed FP4 data.
+#if CVT_FP4_PACK16
+    {
+      // 16 elements -> 8 bytes (u32x2)
+      reinterpret_cast<uint64_t*>(data_dst + g * 8)[0] =
+          (uint64_t(packed.hi) << 32) | uint64_t(packed.lo);
+    }
+#else
+    {
+      // 8 elements -> 4 bytes (uint32_t)
+      int data_byte_offset = g * CVT_FP4_SF_VEC_SIZE / 2 + tg_lane * ELTS / 2;
+      reinterpret_cast<uint32_t*>(data_dst + data_byte_offset)[0] = packed;
+    }
+#endif
+
+    // Write the block scale factor: LINEAR layout, no swizzle.
+    if (sf_out_ptr != nullptr) {
+      sf_dst[g] = sf_val;
+    }
+  }
+
+  // RoPE: direct E4M3 cast of k_pe / k_scale (no scale factors).
+  for (int i = tid; i < pe_dim; i += blockDim.x) {
+    float v = static_cast<float>(rope_src[i]) * global_scale;
+    __nv_fp8_e4m3 q(v);
+    rope_dst[i] = *reinterpret_cast<uint8_t*>(&q);
+  }
+}
+
+// Decode one E2M1 (FP4) code to float.
+__device__ __forceinline__ float e2m1_to_float(uint8_t code) {
+  static constexpr float kE2m1Lut[16] = {
+      0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+  return kE2m1Lut[code & 0xF];
+}
+
+// Kernel: gather context tokens from the page-segmented MLA NVFP4 KV cache
+// ("Option B" layout, see concat_and_cache_mla_nvfp4_kernel above) and
+// dequantize them into a dense [num_tokens, kv_lora_rank + pe_dim] workspace.
+// This is the chunked-prefill / prefix-cache context-read path: the exact
+// inverse of the writer's quantization contract (cache stores x / k_scale):
+//   NoPE: x = fp4 * float(sf_e4m3) * k_scale
+//   RoPE: x = float(e4m3) * k_scale
+//
+// Threading: one CUDA block per gathered token, mirroring
+// gather_and_maybe_dequant_cache in cache_kernels.cu. Each thread dequants
+// 8 packed FP4 elements (one uint32) per iteration, then threads stride
+// over the RoPE tail.
+template <typename scalar_t>
+__global__ void gather_and_dequant_cache_mla_nvfp4_kernel(
+    const uint8_t* __restrict__ src_cache,     // [num_blocks, block_size,
+                                               //  full_dim] bytes
+    scalar_t* __restrict__ dst,                // [num_tokens, nope+pe]
+    const int32_t* __restrict__ block_table,   // [batch, max_blocks]
+    const int32_t* __restrict__ cu_seq_lens,   // [batch+1]
+    const int32_t* __restrict__ token_to_seq,  // [max_tokens_across_chunks]
+    const int32_t num_tokens,
+    const float* __restrict__ scale_ptr,     // checkpoint k_scale
+    const int32_t* __restrict__ seq_starts,  // [batch] or nullptr
+    const int64_t block_table_stride, const int64_t cache_block_stride,
+    const int64_t dst_entry_stride, const int kv_lora_rank, const int pe_dim,
+    const int block_size) {
+  const int32_t token_id = blockIdx.x;
+  if (token_id >= num_tokens) return;
+  const int32_t batch_id = token_to_seq[token_id];
+  const int32_t batch_start = cu_seq_lens[batch_id];
+  const int32_t batch_end = cu_seq_lens[batch_id + 1];
+  // token_to_seq is zero-padded past the chunk's total token count, which
+  // would alias batch 0; the range check drops those.
+  if (token_id >= batch_end) return;
+  int32_t batch_offset = token_id - batch_start;
+  if (seq_starts != nullptr) {
+    batch_offset += seq_starts[batch_id];
+  }
+  const int32_t block_id =
+      block_table[batch_id * block_table_stride + batch_offset / block_size];
+  const int32_t slot = batch_offset % block_size;
+
+  const int token_data_bytes = kv_lora_rank / 2 + pe_dim;  // 320
+  const int sf_dim = kv_lora_rank / CVT_FP4_SF_VEC_SIZE;   // 32
+
+  const uint8_t* __restrict__ page = src_cache + block_id * cache_block_stride;
+  const uint8_t* __restrict__ data =
+      page + static_cast<int64_t>(slot) * token_data_bytes;
+  const uint8_t* __restrict__ rope = data + kv_lora_rank / 2;
+  const uint8_t* __restrict__ sf =
+      page + static_cast<int64_t>(block_size) * token_data_bytes +
+      static_cast<int64_t>(slot) * sf_dim;
+
+  const float k_scale = *scale_ptr;
+  scalar_t* __restrict__ dst_row =
+      dst + static_cast<int64_t>(token_id) * dst_entry_stride;
+
+  // NoPE: one uint32 (8 FP4 elements, element j at bits [4j+3:4j]) per
+  // thread per iteration; elements [8u, 8u+8) share the SF at index u/2.
+  const int num_nope_u32 = kv_lora_rank / 8;
+  for (int u = threadIdx.x; u < num_nope_u32; u += blockDim.x) {
+    const uint32_t packed = reinterpret_cast<const uint32_t*>(data)[u];
+    const float sf_scale =
+        float(reinterpret_cast<const __nv_fp8_e4m3*>(sf)[u >> 1]) * k_scale;
+    alignas(16) scalar_t out[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      out[j] = static_cast<scalar_t>(e2m1_to_float((packed >> (4 * j)) & 0xF) *
+                                     sf_scale);
+    }
+    // 8 x 2-byte scalar_t = 16 bytes; the launcher checks row alignment.
+    reinterpret_cast<uint4*>(dst_row + u * 8)[0] =
+        *reinterpret_cast<uint4*>(out);
+  }
+
+  // RoPE tail: plain E4M3 * k_scale.
+  for (int i = threadIdx.x; i < pe_dim; i += blockDim.x) {
+    const float v =
+        float(reinterpret_cast<const __nv_fp8_e4m3*>(rope)[i]) * k_scale;
+    dst_row[kv_lora_rank + i] = static_cast<scalar_t>(v);
+  }
+}
+
 }  // namespace vllm
 
 // Non-template entry point callable from cache_kernels.cu.
@@ -419,5 +636,138 @@ void reshape_and_cache_nvfp4_dispatch(
           STD_TORCH_CHECK(false,
                           "Unsupported NVFP4 KV cache dtype: ", kv_cache_dtype);
         }
+      });
+}
+
+// Non-template entry point callable from cache_kernels.cu.
+// Writes the page-segmented MLA NVFP4 KV cache layout ("Option B"):
+//   page = [tok_0 data | ... | tok_{B-1} data | tok_0 SFs | ... |
+//           tok_{B-1} SFs]
+// where each token data record is [packed FP4 NoPE | FP8-E4M3 RoPE] and
+// the SFs are linear (non-swizzled) E4M3 NoPE block scales.
+void concat_and_cache_mla_nvfp4_dispatch(
+    torch::stable::Tensor& kv_c,          // [num_tokens, kv_lora_rank]
+    torch::stable::Tensor& k_pe,          // [num_tokens, pe_dim]
+    torch::stable::Tensor& kv_cache,      // [num_blocks, block_size, full_dim]
+    torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    torch::stable::Tensor& scale) {       // [1], float, k_scale
+  // NOTE: slot_mapping.size(0) is the number of actual tokens; kv_c/k_pe
+  // may be padded for CUDA graphs (see concat_and_cache_mla).
+  int num_tokens = slot_mapping.size(0);
+  int kv_lora_rank = kv_c.size(1);
+  int pe_dim = k_pe.size(1);
+
+  STD_TORCH_CHECK(kv_cache.dim() == 3, "kv_cache must be 3D");
+  int block_size = kv_cache.size(1);
+
+  STD_TORCH_CHECK(kv_lora_rank % CVT_FP4_SF_VEC_SIZE == 0,
+                  "kv_lora_rank must be divisible by 16 for NVFP4 MLA KV "
+                  "cache, got ",
+                  kv_lora_rank);
+
+  int token_data_bytes = kv_lora_rank / 2 + pe_dim;
+  int sf_dim = kv_lora_rank / CVT_FP4_SF_VEC_SIZE;
+  int full_dim = token_data_bytes + sf_dim;
+
+  STD_TORCH_CHECK(kv_cache.size(2) == full_dim,
+                  "kv_cache last dim must be kv_lora_rank/2 + pe_dim + "
+                  "kv_lora_rank/16, got ",
+                  kv_cache.size(2), " expected ", full_dim);
+  // The Option-B layout requires each page to be contiguous.
+  STD_TORCH_CHECK(kv_cache.stride(2) == 1 && kv_cache.stride(1) == full_dim,
+                  "kv_cache pages must be contiguous for NVFP4 MLA KV cache");
+
+  int64_t kv_c_stride = kv_c.stride(0);
+  int64_t k_pe_stride = k_pe.stride(0);
+  int64_t block_stride = kv_cache.stride(0);  // page bytes
+
+  constexpr int THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+  int total_groups = kv_lora_rank / CVT_FP4_SF_VEC_SIZE;
+  int num_threads = std::max(total_groups * THREADS_PER_SF, pe_dim);
+  num_threads = std::min(num_threads, 512);
+  num_threads = ((num_threads + 31) / 32) * 32;
+
+  dim3 grid(num_tokens);
+  dim3 block(num_threads);
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      kv_c.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      kv_c.scalar_type(), "concat_and_cache_mla_nvfp4", [&] {
+        vllm::concat_and_cache_mla_nvfp4_kernel<scalar_t>
+            <<<grid, block, 0, stream>>>(kv_c.const_data_ptr<scalar_t>(),
+                                         k_pe.const_data_ptr<scalar_t>(),
+                                         kv_cache.mutable_data_ptr<uint8_t>(),
+                                         slot_mapping.const_data_ptr<int64_t>(),
+                                         scale.const_data_ptr<float>(),
+                                         kv_c_stride, k_pe_stride, block_stride,
+                                         kv_lora_rank, pe_dim, block_size);
+      });
+}
+
+// Non-template entry point callable from cache_kernels.cu.
+// Gathers context tokens from the page-segmented MLA NVFP4 KV cache and
+// dequantizes them into dst rows of [kv_lora_rank | pe_dim] (bf16/half).
+void gather_and_dequant_cache_mla_nvfp4_dispatch(
+    const torch::stable::Tensor& src_cache,     // [num_blocks, block_size,
+                                                //  full_dim] uint8
+    torch::stable::Tensor& dst,                 // [num_tokens, nope+pe]
+    const torch::stable::Tensor& block_table,   // [batch, max_blocks] int32
+    const torch::stable::Tensor& cu_seq_lens,   // [batch+1] int32
+    const torch::stable::Tensor& token_to_seq,  // [max_tokens] int32
+    int64_t num_tokens, int64_t kv_lora_rank,
+    const torch::stable::Tensor& scale,  // [] float, k_scale
+    const int32_t* seq_starts_ptr) {     // [batch] int32 or nullptr
+  int block_size = src_cache.size(1);
+  int dst_dim = dst.size(-1);
+  int pe_dim = dst_dim - static_cast<int>(kv_lora_rank);
+
+  STD_TORCH_CHECK(pe_dim > 0, "dst last dim must exceed kv_lora_rank, got ",
+                  dst_dim, " vs ", kv_lora_rank);
+  STD_TORCH_CHECK(kv_lora_rank % CVT_FP4_SF_VEC_SIZE == 0,
+                  "kv_lora_rank must be divisible by 16, got ", kv_lora_rank);
+
+  int token_data_bytes = kv_lora_rank / 2 + pe_dim;
+  int sf_dim = kv_lora_rank / CVT_FP4_SF_VEC_SIZE;
+  int full_dim = token_data_bytes + sf_dim;
+
+  STD_TORCH_CHECK(src_cache.size(2) == full_dim,
+                  "src_cache last dim must be kv_lora_rank/2 + pe_dim + "
+                  "kv_lora_rank/16, got ",
+                  src_cache.size(2), " expected ", full_dim);
+  STD_TORCH_CHECK(src_cache.stride(2) == 1 && src_cache.stride(1) == full_dim,
+                  "src_cache pages must be contiguous for NVFP4 MLA KV cache");
+
+  int64_t dst_entry_stride = dst.stride(0);
+  // The NoPE dequant path stores 16 bytes (8 elements) at a time.
+  STD_TORCH_CHECK(dst.stride(-1) == 1 && (dst_entry_stride * 2) % 16 == 0,
+                  "dst rows must be contiguous and 16-byte aligned");
+
+  int64_t block_table_stride = block_table.stride(0);
+  int64_t cache_block_stride = src_cache.stride(0);  // page bytes
+
+  constexpr int threads = 64;
+  dim3 grid(num_tokens);
+  dim3 block(threads);
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      src_cache.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      dst.scalar_type(), "gather_and_dequant_cache_mla_nvfp4", [&] {
+        vllm::gather_and_dequant_cache_mla_nvfp4_kernel<scalar_t>
+            <<<grid, block, 0, stream>>>(
+                src_cache.const_data_ptr<uint8_t>(),
+                dst.mutable_data_ptr<scalar_t>(),
+                block_table.const_data_ptr<int32_t>(),
+                cu_seq_lens.const_data_ptr<int32_t>(),
+                token_to_seq.const_data_ptr<int32_t>(),
+                static_cast<int32_t>(num_tokens), scale.const_data_ptr<float>(),
+                seq_starts_ptr, block_table_stride, cache_block_stride,
+                dst_entry_stride, static_cast<int>(kv_lora_rank), pe_dim,
+                block_size);
       });
 }

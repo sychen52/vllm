@@ -946,6 +946,86 @@ void concat_and_cache_mla_grouped(
           kv_c_token_stride, k_pe_layer_stride, k_pe_token_stride,
           slot_layer_stride, block_stride, entry_stride, kv_lora_rank, pe_dim,
           block_size);
+// Quantize kv_c to NVFP4 (with linear E4M3 block scales) and k_pe to
+// FP8-E4M3, then cache them in the page-segmented MLA NVFP4 layout.
+void concat_and_cache_mla_nvfp4(
+    torch::stable::Tensor& kv_c,          // [num_tokens, kv_lora_rank]
+    torch::stable::Tensor& k_pe,          // [num_tokens, pe_dim]
+    torch::stable::Tensor& kv_cache,      // [num_blocks, block_size,
+                                          // kv_lora_rank/2 + pe_dim +
+                                          // kv_lora_rank/16] bytes, see
+                                          // nvfp4_kv_cache_kernels.cu
+    torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    torch::stable::Tensor& scale) {       // [1], float, k_scale
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
+  // NVFP4 dispatch is compiled separately for SM100+.
+  extern void concat_and_cache_mla_nvfp4_dispatch(
+      torch::stable::Tensor & kv_c, torch::stable::Tensor & k_pe,
+      torch::stable::Tensor & kv_cache, torch::stable::Tensor & slot_mapping,
+      torch::stable::Tensor & scale);
+  concat_and_cache_mla_nvfp4_dispatch(kv_c, k_pe, kv_cache, slot_mapping,
+                                      scale);
+#else
+  STD_TORCH_CHECK(false,
+                  "NVFP4 MLA KV cache requires SM100+ (Blackwell). "
+                  "Please rebuild vllm with a Blackwell-compatible CUDA "
+                  "target.");
+#endif
+}
+
+// Gather context tokens from the page-segmented MLA NVFP4 KV cache and
+// dequantize them into dst (the chunked-prefill workspace). The inverse of
+// concat_and_cache_mla_nvfp4; indexing mirrors gather_and_maybe_dequant_cache
+// (cu_seq_lens/token_to_seq/seq_starts have the same semantics).
+void gather_and_dequant_cache_mla_nvfp4(
+    torch::stable::Tensor const& src_cache,     // [num_blocks, block_size,
+                                                //  full_dim] uint8
+    torch::stable::Tensor const& dst,           // [tot_tokens, nope+pe]
+    torch::stable::Tensor const& block_table,   // [batch, max_blocks]
+    torch::stable::Tensor const& cu_seq_lens,   // [batch+1]
+    torch::stable::Tensor const& token_to_seq,  // [max_tokens across chunks]
+    int64_t num_tokens, int64_t kv_lora_rank,
+    torch::stable::Tensor const& scale,  // [1], float, k_scale
+    std::optional<torch::stable::Tensor> seq_starts = std::nullopt) {
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
+  STD_TORCH_CHECK(
+      block_table.scalar_type() == torch::headeronly::ScalarType::Int,
+      "block_table must be int32");
+  STD_TORCH_CHECK(
+      cu_seq_lens.scalar_type() == torch::headeronly::ScalarType::Int,
+      "cu_seq_lens must be int32");
+  STD_TORCH_CHECK(
+      token_to_seq.scalar_type() == torch::headeronly::ScalarType::Int,
+      "token_to_seq must be int32");
+  STD_TORCH_CHECK(src_cache.device() == dst.device(),
+                  "src_cache and dst must be on the same device");
+  const int32_t* seq_starts_ptr = nullptr;
+  if (seq_starts.has_value()) {
+    STD_TORCH_CHECK(
+        seq_starts.value().scalar_type() == torch::headeronly::ScalarType::Int,
+        "seq_starts must be int32");
+    STD_TORCH_CHECK(src_cache.device() == seq_starts.value().device(),
+                    "src_cache and seq_starts must be on the same device");
+    seq_starts_ptr = seq_starts.value().const_data_ptr<int32_t>();
+  }
+
+  extern void gather_and_dequant_cache_mla_nvfp4_dispatch(
+      const torch::stable::Tensor& src_cache, torch::stable::Tensor& dst,
+      const torch::stable::Tensor& block_table,
+      const torch::stable::Tensor& cu_seq_lens,
+      const torch::stable::Tensor& token_to_seq, int64_t num_tokens,
+      int64_t kv_lora_rank, const torch::stable::Tensor& scale,
+      const int32_t* seq_starts_ptr);
+  auto dst_mut = dst;
+  gather_and_dequant_cache_mla_nvfp4_dispatch(
+      src_cache, dst_mut, block_table, cu_seq_lens, token_to_seq, num_tokens,
+      kv_lora_rank, scale, seq_starts_ptr);
+#else
+  STD_TORCH_CHECK(false,
+                  "NVFP4 MLA KV cache requires SM100+ (Blackwell). "
+                  "Please rebuild vllm with a Blackwell-compatible CUDA "
+                  "target.");
+#endif
 }
 
 namespace vllm {

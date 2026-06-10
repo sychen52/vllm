@@ -274,6 +274,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
     np_to_pinned_tensor,
+    nvfp4_mla_kv_cache_full_dim,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -792,7 +793,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4"):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         assert (
@@ -1405,6 +1406,8 @@ class MLACommonBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4":
+            return (num_blocks, block_size, nvfp4_mla_kv_cache_full_dim(head_size))
         return (num_blocks, block_size, head_size)
 
     @staticmethod
@@ -2619,6 +2622,28 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     block_table=block_table,
                     workspace_starts=chunk.cu_seq_lens,
                     batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            elif self.kv_cache_dtype == "nvfp4":
+                # The NVFP4 MLA cache needs its dedicated gather: mixed
+                # FP4-NoPE/FP8-RoPE records with block scales, dequantized
+                # to the model-dtype workspace. FP8 prefill queries would
+                # need an FP8 workspace, which this path does not produce.
+                if use_fp8_prefill:
+                    raise NotImplementedError(
+                        "kv_cache_dtype='nvfp4' with MLA does not support "
+                        "FP8 prefill query quantization; disable "
+                        "use_prefill_query_quantization."
+                    )
+                ops.gather_and_dequant_cache_mla_nvfp4(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=block_table,
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                    num_tokens=toks,
+                    kv_lora_rank=self.kv_lora_rank,
+                    scale=k_scale,
                     seq_starts=chunk.starts,
                 )
             elif not use_fp8_prefill:

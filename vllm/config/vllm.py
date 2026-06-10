@@ -2531,13 +2531,19 @@ class VllmConfig:
         if self.model_config is None:
             return self
         if (
-            self.cache_config.cache_dtype.startswith("nvfp4")
-            and self.model_config.use_mla
+            self.cache_config is not None
+            and self.cache_config.cache_dtype.startswith("nvfp4")
+            and self.model_config.is_deepseek_mla
+            and self.attention_config is not None
+            and self.attention_config.use_prefill_query_quantization
         ):
+            # The NVFP4 MLA chunked-prefill/prefix-cache context read
+            # dequantizes into a model-dtype workspace; FP8 prefill query
+            # quantization would need an FP8 workspace instead.
             raise ValueError(
-                "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
-                "Attention) backends. Please use a different --kv-cache-dtype "
-                "(e.g., 'fp8' or 'auto') for MLA models such as DeepSeek."
+                "kv_cache_dtype='nvfp4' with MLA does not support FP8 "
+                "prefill query quantization; disable "
+                "use_prefill_query_quantization in --attention-config."
             )
         return self
 

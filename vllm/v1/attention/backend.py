@@ -1156,6 +1156,19 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
             return
         from vllm import _custom_ops as ops
 
+        if kv_cache_dtype == "nvfp4":
+            # Fused CUDA kernel: NVFP4-quantize the NoPE dims (linear,
+            # non-swizzled block scales) and FP8-E4M3 cast the RoPE dims
+            # into the page-segmented MLA NVFP4 cache layout.
+            ops.concat_and_cache_mla_nvfp4(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
+                scale=k_scale,
+            )
+            return
+
         ops.concat_and_cache_mla(
             kv_c_normed,
             k_pe.squeeze(1),

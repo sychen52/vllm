@@ -11,6 +11,7 @@ from flashinfer.utils import (
 )
 
 from vllm.config import get_current_vllm_config
+import vllm.envs as envs
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -127,6 +128,7 @@ class FlashInferMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -259,6 +261,12 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             _sched.max_num_batched_tokens or _sched.max_num_seqs
         )
         self._mla_counter_bytes: int | None = None
+        self.flashinfer_mla_backend = envs.VLLM_FLASHINFER_MLA_BACKEND
+        if self.flashinfer_mla_backend != "auto":
+            logger.info_once(
+                "Using FlashInfer MLA backend=%s",
+                self.flashinfer_mla_backend,
+            )
 
     def forward_mqa(
         self,
@@ -297,12 +305,18 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         else:
             q = q.view(attn_metadata.num_decodes, -1, q.shape[-2], q.shape[-1])
 
-        if self.bmm1_scale is None:
+        if self.kv_cache_dtype == "nvfp4":
+            self.bmm1_scale = (
+                float(layer._q_scale_float) * float(layer._k_scale_float) * self.scale
+            )
+        elif self.bmm1_scale is None:
             self.bmm1_scale = self.scale
             if is_quantized_kv_cache(self.kv_cache_dtype):
                 self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
 
-        if self.bmm2_scale is None:
+        if self.kv_cache_dtype == "nvfp4":
+            self.bmm2_scale = float(layer._k_scale_float)
+        elif self.bmm2_scale is None:
             self.bmm2_scale = 1.0
             if is_quantized_kv_cache(self.kv_cache_dtype):
                 self.bmm2_scale *= layer._k_scale_float
@@ -334,6 +348,19 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 _get_multi_ctas_kv_counter_buffer(self._mla_counter_bytes, q.device)
             )
+        if self.flashinfer_mla_backend != "auto":
+            extra_kwargs["backend"] = self.flashinfer_mla_backend
+        out = None
+        if self.kv_cache_dtype == "nvfp4":
+            # BF16-out w4a8 kernels write the up-projection's input dtype
+            # directly from the BMM2 epilogue, skipping a separate
+            # FP8->BF16 pass over the attention output.
+            out = torch.empty(
+                q.shape[:-1] + (self.kv_lora_rank,),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
@@ -346,6 +373,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
+            out=out,
             return_lse=return_lse,
             **extra_kwargs,
         )
@@ -356,5 +384,12 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # Flatten the output for consistent shape
         o = o.view(-1, o.shape[-2], o.shape[-1])
+        if self.kv_cache_dtype == "nvfp4":
+            # The kernel emits FP8; the decode output feeds the absorbed
+            # value up-projection bmm against W_UV (dequantized to model
+            # dtype), so follow that consumer's dtype. kv_b_proj.weight is
+            # the wrong reference: it is the prefill-path consumer and may
+            # itself be serialized quantized (fp8/uint8).
+            o = o.to(layer.W_UV.dtype)  # type: ignore[attr-defined]
 
         return o, lse

@@ -943,6 +943,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                             Tensor slot_mapping,"
       "                             int block_size, int block_stride,"
       "                             int entry_stride) -> ()");
+  // Quantize kv_c to NVFP4 (linear block scales) and k_pe to FP8-E4M3,
+  // then cache them in the page-segmented MLA NVFP4 layout.
+  ops.def(
+      "concat_and_cache_mla_nvfp4(Tensor kv_c, Tensor k_pe,"
+      "                           Tensor! kv_cache,"
+      "                           Tensor slot_mapping,"
+      "                           Tensor scale) -> ()");
 
   // Rotate Q and K, then write to kv cache for MLA
   ops.def(
@@ -972,6 +979,18 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                               int num_tokens, "
       "                               str kv_cache_dtype, "
       "                               Tensor scale, Tensor? seq_starts) -> ()");
+
+  // Gather + dequantize context tokens from the page-segmented MLA NVFP4
+  // KV cache into the chunked-prefill workspace (inverse of
+  // concat_and_cache_mla_nvfp4).
+  ops.def(
+      "gather_and_dequant_cache_mla_nvfp4(Tensor src_cache, Tensor! dst, "
+      "                                   Tensor block_table, "
+      "                                   Tensor cu_seq_lens, "
+      "                                   Tensor token_to_seq, "
+      "                                   int num_tokens, int kv_lora_rank, "
+      "                                   Tensor scale, "
+      "                                   Tensor? seq_starts) -> ()");
 
   ops.def(
       "cp_gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
@@ -1044,11 +1063,15 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("concat_and_cache_mla", TORCH_BOX(&concat_and_cache_mla));
   ops.impl("concat_and_cache_mla_grouped",
            TORCH_BOX(&concat_and_cache_mla_grouped));
+  ops.impl("concat_and_cache_mla_nvfp4",
+           TORCH_BOX(&concat_and_cache_mla_nvfp4));
   ops.impl("concat_and_cache_mla_rope_fused",
            TORCH_BOX(&concat_and_cache_mla_rope_fused));
   ops.impl("convert_fp8", TORCH_BOX(&convert_fp8));
   ops.impl("gather_and_maybe_dequant_cache",
            TORCH_BOX(&gather_and_maybe_dequant_cache));
+  ops.impl("gather_and_dequant_cache_mla_nvfp4",
+           TORCH_BOX(&gather_and_dequant_cache_mla_nvfp4));
   ops.impl("cp_gather_cache", TORCH_BOX(&cp_gather_cache));
   ops.impl("cp_gather_and_upconvert_fp8_kv_cache",
            TORCH_BOX(&cp_gather_and_upconvert_fp8_kv_cache));
