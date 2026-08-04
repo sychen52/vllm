@@ -467,12 +467,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         the backend reads it as E4M3 rather than fp4/E2M1 -- the latter doubles
         the perceived head dim (``head_size * 2``) and fails the kernel's
         ``head_dim_k == head_dim_q`` check. Mirrors ``MLAAttention.forward``;
-        the fp8_ds_mla layout keeps its native uint8 view.
+        the fp8_ds_mla and nvfp4 layouts keep their native uint8 view.
         """
         cache = self.kv_cache
         if (
             is_quantized_kv_cache(self.kv_cache_dtype)
             and self.kv_cache_dtype != "fp8_ds_mla"
+            and self.kv_cache_dtype != "nvfp4"
         ):
             return cache.view(current_platform.fp8_dtype())
         return cache
@@ -689,6 +690,32 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 positions=positions,
                 cos_sin_cache=cos_sin_cache,
             )
+        if self.kv_cache_dtype == "nvfp4":
+            # Mixed NoPE-FP4/RoPE-FP8 record. K3's fused inserts only emit the
+            # bf16 / plain-fp8 / fp8_ds_mla layouts, so write the cache with the
+            # shared NVFP4 MLA store and build the fp8 decode query separately.
+            assert self.impl.supports_quant_query_input, (  # type: ignore[attr-defined]
+                "Kimi-K3 NVFP4 KV cache decode requires a backend that accepts "
+                "an fp8 (quantized) query input."
+            )
+            # This arm does its own concat and so never applies RoPE; the NVFP4
+            # layers are NoPE. A rope-enabled layer (DSpark draft) would need
+            # the rotation folded in here.
+            assert cos_sin_cache is None, (
+                "Kimi-K3 nvfp4 KV cache is only supported on NoPE MLA layers."
+            )
+            cache = self.kv_cache
+            if cache.dtype != torch.uint8:
+                cache = cache.view(torch.uint8)
+            ops.concat_and_cache_mla_nvfp4(
+                kv_c_normed,
+                k_pe.reshape(k_pe.shape[0], -1),
+                cache,
+                slot_mapping,
+                self._k_scale,
+            )
+            mqa_q = torch.cat([ql_nope, q_pe], dim=-1)
+            return (mqa_q * self._q_scale_inv).to(current_platform.fp8_dtype())
         if is_quantized_kv_cache(self.kv_cache_dtype):
             cache = self.kv_cache
             if cache.dtype != torch.float8_e4m3fn:
@@ -948,6 +975,30 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 positions,
                 cos_sin_cache,
             )
+        elif self.kv_cache_dtype == "nvfp4":
+            # NVFP4 cache (352B mixed NoPE-FP4/RoPE-FP8); bf16 attention. The
+            # chunked-context read dequantizes into a model-dtype workspace, so
+            # an fp8 prefill query has no matching workspace (see
+            # VllmConfig.validate_nvfp4_kv_cache_with_mla).
+            assert not fp8_prefill, (
+                "Kimi-K3 nvfp4 uses a bf16 prefill query; disable "
+                "use_prefill_query_quantization."
+            )
+            assert cos_sin_cache is None, (
+                "Kimi-K3 nvfp4 KV cache is only supported on NoPE MLA layers."
+            )
+            kv_cache = self.kv_cache
+            if kv_cache.dtype != torch.uint8:
+                kv_cache = kv_cache.view(torch.uint8)
+            ops.concat_and_cache_mla_nvfp4(
+                kv_c_normed,
+                k_pe.reshape(k_pe.shape[0], -1),
+                kv_cache,
+                slot_mapping,
+                self._k_scale,
+            )
+            # K3 is NoPE, so k_pe needs no rotation before the concat.
+            k = torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1)
         elif is_quantized_kv_cache(self.kv_cache_dtype):
             assert fp8_prefill, (
                 "Kimi-K3 fp8 KV cache requires an fp8 prefill query; enable "

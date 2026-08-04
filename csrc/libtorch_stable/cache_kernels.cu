@@ -946,6 +946,8 @@ void concat_and_cache_mla_grouped(
           kv_c_token_stride, k_pe_layer_stride, k_pe_token_stride,
           slot_layer_stride, block_stride, entry_stride, kv_lora_rank, pe_dim,
           block_size);
+}
+
 // Quantize kv_c to NVFP4 (with linear E4M3 block scales) and k_pe to
 // FP8-E4M3, then cache them in the page-segmented MLA NVFP4 layout.
 void concat_and_cache_mla_nvfp4(
