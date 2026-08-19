@@ -561,8 +561,8 @@ def main():
     parser.add_argument(
         "--kv-cache-dtype",
         default="auto",
-        choices=["auto", "fp8"],
-        help="KV cache dtype: auto or fp8",
+        choices=["auto", "fp8", "nvfp4"],
+        help="KV cache dtype: auto, fp8, or nvfp4",
     )
     parser.add_argument(
         "--cuda-graphs",
@@ -670,6 +670,9 @@ def main():
         # Prefill backends (e.g., ["fa3", "fa4"])
         args.prefill_backends = yaml_config.get("prefill_backends", None)
         args.prefill_backend = yaml_config.get("prefill_backend", None)
+        args.use_prefill_query_quantization = yaml_config.get(
+            "use_prefill_query_quantization", False
+        )
 
         # FP8 output benchmark knobs; CLI wins.
         if args.fp8_output_scale is None:
@@ -1325,12 +1328,19 @@ def main():
                             num_kv_heads=args.num_kv_heads,
                             block_size=args.block_size,
                             device=args.device,
+                            max_model_len=getattr(args, "max_model_len", None),
                             profile_memory=args.profile_memory,
                             kv_cache_dtype=args.kv_cache_dtype,
                             use_cuda_graphs=args.cuda_graphs,
                             ncu_profile=args.ncu_profile,
+                            torch_profile=args.torch_profile,
+                            torch_profile_dir=args.torch_profile_dir,
+                            torch_profile_iters=args.torch_profile_iters,
                             warmup_ms=args.warmup_ms,
                             num_splits=args.num_splits,
+                            kv_lora_rank=getattr(args, "kv_lora_rank", None),
+                            qk_nope_head_dim=getattr(args, "qk_nope_head_dim", None),
+                            qk_rope_head_dim=getattr(args, "qk_rope_head_dim", None),
                         )
 
                         result = run_benchmark(config)
@@ -1371,9 +1381,14 @@ def main():
                             num_kv_heads=args.num_kv_heads,
                             block_size=args.block_size,
                             device=args.device,
+                            max_model_len=getattr(args, "max_model_len", None),
                             profile_memory=args.profile_memory,
                             warmup_ms=args.warmup_ms,
                             prefill_backend=pb,
+                            use_prefill_query_quantization=getattr(
+                                args, "use_prefill_query_quantization", False
+                            ),
+                            kv_cache_dtype=args.kv_cache_dtype,
                             kv_lora_rank=args.kv_lora_rank,
                             qk_nope_head_dim=args.qk_nope_head_dim,
                             qk_rope_head_dim=args.qk_rope_head_dim,

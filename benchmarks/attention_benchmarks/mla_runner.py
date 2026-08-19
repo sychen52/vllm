@@ -122,6 +122,7 @@ def create_minimal_vllm_config(
     mla_dims: dict | None = None,
     index_topk: int | None = None,
     prefill_backend: str | None = None,
+    use_prefill_query_quantization: bool = False,
     kv_cache_dtype: str = "auto",
     sparse_mla_force_mqa: bool = False,
 ) -> VllmConfig:
@@ -140,6 +141,7 @@ def create_minimal_vllm_config(
         prefill_backend: Prefill backend name (e.g., "fa3", "fa4", "flashinfer",
                         "trtllm"). Configures the attention config to force
                         the specified prefill backend.
+        use_prefill_query_quantization: Quantize MLA prefill queries to FP8.
         sparse_mla_force_mqa: If True, forces all sparse MLA tokens through
                     forward_mqa (even prefill tokens).
 
@@ -247,6 +249,9 @@ def create_minimal_vllm_config(
             vllm_config.attention_config.flash_attn_version = prefill_cfg[
                 "flash_attn_version"
             ]
+    vllm_config.attention_config.use_prefill_query_quantization = (
+        use_prefill_query_quantization
+    )
 
     if sparse_mla_force_mqa:
         vllm_config.attention_config.sparse_mla_force_mqa = True
@@ -665,6 +670,13 @@ def _create_backend_impl(
 
     # Create mock layer
     layer = MockLayer(device, impl=impl, kv_cache_spec=kv_cache_spec)
+    layer.q_lora_rank = None
+    layer.kv_lora_rank = mla_dims["kv_lora_rank"]
+    layer.qk_nope_head_dim = mla_dims["qk_nope_head_dim"]
+    layer.qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    layer.v_head_dim = mla_dims["v_head_dim"]
+    layer.kv_b_proj = kv_b_proj
+    layer.W_UV = kv_b_proj.weight
 
     # Attach a prefill backend (MLAAttention does this in __init__; the metadata
     # builder reads layer.prefill_backend from static_forward_context).
@@ -827,6 +839,16 @@ def _run_single_benchmark(
             device=device,
             dtype=torch.uint8,
         ).view(current_platform.fp8_dtype())
+    elif kv_cache_dtype == "nvfp4":
+        from vllm.utils.torch_utils import nvfp4_mla_kv_cache_full_dim
+
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            nvfp4_mla_kv_cache_full_dim(head_size),
+            device=device,
+            dtype=torch.uint8,
+        )
     else:
         kv_cache = torch.zeros(
             num_blocks,
@@ -879,7 +901,7 @@ def _run_single_benchmark(
     num_prefill = total_q - num_decode
 
     # Some backends requires fp8 queries when using fp8 KV cache.
-    is_fp8_kvcache = kv_cache_dtype.startswith("fp8")
+    is_fp8_kvcache = kv_cache_dtype.startswith("fp8") or kv_cache_dtype == "nvfp4"
     quantize_query = is_fp8_kvcache and getattr(
         impl, "supports_quant_query_input", False
     )
@@ -1123,6 +1145,9 @@ def _run_mla_benchmark_batched(
         mla_dims=mla_dims,  # Use custom dims from config or default
         index_topk=index_topk if is_sparse else None,
         prefill_backend=prefill_backend,
+        use_prefill_query_quantization=getattr(
+            first_config, "use_prefill_query_quantization", False
+        ),
         kv_cache_dtype=kv_cache_dtype,
         sparse_mla_force_mqa=sparse_mla_force_mqa,
     )

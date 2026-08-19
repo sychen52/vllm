@@ -51,6 +51,7 @@ from vllm.model_executor.layers.attention.attention import (
     should_load_quant_weights,
 )
 from vllm.model_executor.layers.attention.mla_attention import (
+    _context_gather_needs_dequant,
     _get_kv_b_proj_input_dtype,
     accumulate_mla_context_chunk,
     init_mla_context_partial,
@@ -78,6 +79,7 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_kv_concat,
     fused_mla_kv_concat_quant_fp8,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
+    fused_mla_qkv_quant_kv_cache_nvfp4_insert,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -401,6 +403,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # fp8_ds_mla: 656-byte custom layout; see flashmla_sparse.py.
+            # NVFP4 is sized by MLAAttentionSpec.state_content_size_bytes.
             state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
@@ -770,8 +773,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         takes the fp8 latent directly, and required for a bf16 one, which is
         what a stock K3 checkpoint carries. Its output is bf16 either way.
 
-        The gathered ``k_pe`` is likewise used as-is (fp8 for a plain fp8 cache)
-        and needs no RoPE: it was rotated on the way in.
+        The gathered ``k_pe`` is likewise used as-is in the workspace dtype and
+        needs no RoPE: it was rotated on the way in.
 
         Chunk partials are written straight into the accumulating context partial
         when the prefill backend honors ``out``, so only the (64x smaller) lse is
@@ -886,9 +889,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         """Gather one chunk's paged context latent into the workspace.
 
-        Dispatched exactly as in ``impl._compute_prefill_context``: an fp8 query
-        reads the plain fp8 cache in its stored layout, anything else lands in the
-        workspace as the model dtype.
+        Dispatched exactly as in ``impl._compute_prefill_context``. A plain FP8
+        cache is copied raw only when the projection accepts the FP8 workspace;
+        otherwise the gather applies the cache scale into the model-dtype
+        workspace before projection.
         """
         workspace = prefill.chunked_context.workspace
         toks = chunk.num_context_tokens
@@ -902,7 +906,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 batch_size=chunk.num_requests,
                 seq_starts=chunk.starts,
             )
-        elif not fp8_prefill:
+        elif self.kv_cache_dtype == "nvfp4":
+            # Checked before the fp8_prefill split: the NVFP4 record (mixed
+            # FP4-NoPE/FP8-RoPE plus block scales) has to go through its own
+            # dequantizing gather either way -- neither the raw cp_gather_cache
+            # copy nor gather_and_maybe_dequant_cache understands the layout,
+            # and the raw copy would fail outright on the uint8/workspace dtype
+            # mismatch. The workspace is already typed for kv_b_proj's input.
+            ops.gather_and_dequant_cache_mla_nvfp4(
+                src_cache=kv_cache,
+                dst=workspace,
+                block_table=block_table,
+                cu_seq_lens=chunk.cu_seq_lens,
+                token_to_seq=chunk.token_to_seq,
+                num_tokens=toks,
+                kv_lora_rank=self.kv_lora_rank,
+                scale=self._k_scale,
+                seq_starts=chunk.starts,
+            )
+        elif _context_gather_needs_dequant(workspace.dtype, fp8_prefill):
             ops.gather_and_maybe_dequant_cache(
                 src_cache=kv_cache,
                 dst=workspace,
@@ -946,6 +968,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
           - bf16 cache        -> bf16 prefill query
           - plain fp8 cache   -> fp8 prefill query (unscaled q/k/v; cache _k_scale)
           - fp8_ds_mla cache  -> bf16 prefill query (656B per-tile self-scaled)
+          - nvfp4 cache       -> either; an fp8 query quantizes q/k/v unscaled
+                                 and the context gather writes an fp8 workspace
         """
         prefill = attn_metadata.prefill
         has_context = prefill.chunked_context is not None
@@ -976,29 +1000,45 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
         elif self.kv_cache_dtype == "nvfp4":
-            # NVFP4 cache (352B mixed NoPE-FP4/RoPE-FP8); bf16 attention. The
-            # chunked-context read dequantizes into a model-dtype workspace, so
-            # an fp8 prefill query has no matching workspace (see
-            # VllmConfig.validate_nvfp4_kv_cache_with_mla).
-            assert not fp8_prefill, (
-                "Kimi-K3 nvfp4 uses a bf16 prefill query; disable "
-                "use_prefill_query_quantization."
-            )
+            # NVFP4 cache (352B mixed NoPE-FP4/RoPE-FP8). The cache write always
+            # quantizes from the bf16 projections, so the current chunk carries
+            # no NVFP4 error; only the chunked context, read back through
+            # gather_and_dequant_cache_mla_nvfp4, does.
             assert cos_sin_cache is None, (
                 "Kimi-K3 nvfp4 KV cache is only supported on NoPE MLA layers."
             )
             kv_cache = self.kv_cache
             if kv_cache.dtype != torch.uint8:
                 kv_cache = kv_cache.view(torch.uint8)
-            ops.concat_and_cache_mla_nvfp4(
-                kv_c_normed,
-                k_pe.reshape(k_pe.shape[0], -1),
-                kv_cache,
-                slot_mapping,
-                self._k_scale,
-            )
-            # K3 is NoPE, so k_pe needs no rotation before the concat.
-            k = torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1)
+            if fp8_prefill:
+                # One launch: quantize q/k/v to fp8 (unscaled, like the plain
+                # fp8 arm below) and write the NVFP4 latent. The context gather
+                # folds k_scale into its fp8 workspace, so both halves of the
+                # online-softmax merge are in real units and bmm1_scale needs
+                # no correction.
+                q, k, v = fused_mla_qkv_quant_kv_cache_nvfp4_insert(
+                    q,
+                    k_nope,
+                    k_pe,
+                    kv_c_normed,
+                    v,
+                    kv_cache,
+                    slot_mapping,
+                    self._one_scale,
+                    self._one_scale,
+                    self._one_scale,
+                    self._k_scale_inv,
+                )
+            else:
+                ops.concat_and_cache_mla_nvfp4(
+                    kv_c_normed,
+                    k_pe.reshape(k_pe.shape[0], -1),
+                    kv_cache,
+                    slot_mapping,
+                    self._k_scale,
+                )
+                # K3 is NoPE, so k_pe needs no rotation before the concat.
+                k = torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1)
         elif is_quantized_kv_cache(self.kv_cache_dtype):
             assert fp8_prefill, (
                 "Kimi-K3 fp8 KV cache requires an fp8 prefill query; enable "

@@ -212,6 +212,63 @@ def fused_mla_kv_concat_quant_fp8(
     return k_fp8, v_fp8
 
 
+def fused_mla_qkv_quant_kv_cache_nvfp4_insert(
+    q: torch.Tensor,  # [Tp, H, qk_head_dim]
+    k_nope: torch.Tensor,  # [Tp, H, qk_nope_head_dim]
+    k_pe: torch.Tensor,  # [Tp, qk_rope_head_dim] or [Tp, 1, qk_rope_head_dim]
+    kv_c_normed: torch.Tensor,  # [Tp, kv_lora_rank]
+    v: torch.Tensor,  # [Tp, H, v_head_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, 352] uint8
+    slot_mapping: torch.Tensor,  # [Tp] int64
+    q_scale_inv: torch.Tensor,  # scalar fp32, 1 / q scale
+    k_scale_inv: torch.Tensor,  # scalar fp32, 1 / k scale
+    v_scale_inv: torch.Tensor,  # scalar fp32, 1 / v scale
+    cache_scale_inv: torch.Tensor,  # scalar fp32, 1 / k_scale (cache latent)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize q/k/v to fp8 and insert the NVFP4 latent into the paged cache.
+
+    The NVFP4 counterpart of :func:`fused_mla_qkv_quant_kv_cache_fp8_insert`:
+    same per-head work (the prefill kernel still consumes fp8 q/k/v), but the
+    cache write emits the 352-byte page-segmented NVFP4 record instead of a
+    576-byte fp8 one, bit-compatible with ``concat_and_cache_mla_nvfp4``.
+
+    NoPE-only: the NVFP4 MLA layout has no RoPE stage, so no positions or
+    cos/sin cache are accepted.
+
+    Returns ``(q_fp8, k_fp8, v_fp8)``; writes ``kv_cache`` in place.
+    """
+    k_pe = k_pe.reshape(k_pe.shape[0], -1)
+    tp, num_heads, _ = q.shape
+    qk_head_dim = q.shape[2]
+    v_head_dim = v.shape[2]
+    fp8 = torch.float8_e4m3fn
+    q_fp8 = torch.empty((tp, num_heads, qk_head_dim), dtype=fp8, device=q.device)
+    k_fp8 = torch.empty((tp, num_heads, qk_head_dim), dtype=fp8, device=q.device)
+    v_fp8 = torch.empty((tp, num_heads, v_head_dim), dtype=fp8, device=q.device)
+    if tp == 0:
+        return q_fp8, k_fp8, v_fp8
+    torch.ops._C.fused_kimi_k3_mla_qkv_quant_kv_cache_nvfp4_insert(
+        q,
+        k_nope,
+        k_pe,
+        kv_c_normed,
+        v,
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        kv_cache,
+        slot_mapping,
+        q_scale_inv,
+        k_scale_inv,
+        v_scale_inv,
+        cache_scale_inv,
+        kv_cache.shape[1],
+        None,
+        None,
+    )
+    return q_fp8, k_fp8, v_fp8
+
+
 def fused_mla_decode_q_concat_kv_cache_insert(
     ql_nope: torch.Tensor,  # [B, H, kv_lora_rank]  (BMM1 output, absorbed q)
     q_pe: torch.Tensor,  # [B, H, qk_rope_head_dim]

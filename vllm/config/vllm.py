@@ -2527,27 +2527,6 @@ class VllmConfig:
             )
 
     @model_validator(mode="after")
-    def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
-        if self.model_config is None:
-            return self
-        if (
-            self.cache_config is not None
-            and self.cache_config.cache_dtype.startswith("nvfp4")
-            and self.model_config.is_deepseek_mla
-            and self.attention_config is not None
-            and self.attention_config.use_prefill_query_quantization
-        ):
-            # The NVFP4 MLA chunked-prefill/prefix-cache context read
-            # dequantizes into a model-dtype workspace; FP8 prefill query
-            # quantization would need an FP8 workspace instead.
-            raise ValueError(
-                "kv_cache_dtype='nvfp4' with MLA does not support FP8 "
-                "prefill query quantization; disable "
-                "use_prefill_query_quantization in --attention-config."
-            )
-        return self
-
-    @model_validator(mode="after")
     def validate_mamba_block_size(self) -> "VllmConfig":
         if self.model_config is None:
             return self

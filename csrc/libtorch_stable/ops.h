@@ -323,6 +323,21 @@ void fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert(
     std::optional<torch::stable::Tensor> position_ids,
     std::optional<torch::stable::Tensor> cos_sin_cache);
 
+#ifndef USE_ROCM
+void fused_kimi_k3_mla_qkv_quant_kv_cache_nvfp4_insert(
+    torch::stable::Tensor const& q, torch::stable::Tensor const& k_nope,
+    torch::stable::Tensor const& k_pe, torch::stable::Tensor const& kv_c_normed,
+    torch::stable::Tensor const& v, torch::stable::Tensor& q_fp8,
+    torch::stable::Tensor& k_fp8, torch::stable::Tensor& v_fp8,
+    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& q_scale_inv,
+    torch::stable::Tensor const& k_scale_inv,
+    torch::stable::Tensor const& v_scale_inv,
+    torch::stable::Tensor const& cache_scale_inv, int64_t cache_block_size,
+    std::optional<torch::stable::Tensor> position_ids,
+    std::optional<torch::stable::Tensor> cos_sin_cache);
+#endif
+
 void fused_kimi_k3_mla_decode_q_concat_kv_cache_insert(
     torch::stable::Tensor const& ql_nope, torch::stable::Tensor const& q_pe,
     torch::stable::Tensor const& kv_c_normed, torch::stable::Tensor const& k_pe,

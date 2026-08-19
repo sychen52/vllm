@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <string>
+#include <type_traits>
 
 namespace vllm {
 
@@ -448,6 +449,18 @@ __device__ __forceinline__ float e2m1_to_float(uint8_t code) {
 // gather_and_maybe_dequant_cache in cache_kernels.cu. Each thread dequants
 // 8 packed FP4 elements (one uint32) per iteration, then threads stride
 // over the RoPE tail.
+// Cast a dequantized value to the workspace dtype. The FP8 workspace feeds an
+// FP8 prefill kernel, so it must saturate rather than produce inf; the 2-byte
+// dtypes hold E2M1 x E4M3 exactly and just convert.
+template <typename T>
+__device__ __forceinline__ T dequant_cast(float v) {
+  if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+    return __nv_fp8_e4m3(v);
+  } else {
+    return static_cast<T>(v);
+  }
+}
+
 template <typename scalar_t>
 __global__ void gather_and_dequant_cache_mla_nvfp4_kernel(
     const uint8_t* __restrict__ src_cache,     // [num_blocks, block_size,
@@ -503,19 +516,21 @@ __global__ void gather_and_dequant_cache_mla_nvfp4_kernel(
     alignas(16) scalar_t out[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      out[j] = static_cast<scalar_t>(e2m1_to_float((packed >> (4 * j)) & 0xF) *
-                                     sf_scale);
+      out[j] = dequant_cast<scalar_t>(e2m1_to_float((packed >> (4 * j)) & 0xF) *
+                                      sf_scale);
     }
-    // 8 x 2-byte scalar_t = 16 bytes; the launcher checks row alignment.
-    reinterpret_cast<uint4*>(dst_row + u * 8)[0] =
-        *reinterpret_cast<uint4*>(out);
+    // 8 elements: 16 bytes for the 2-byte dtypes, 8 bytes for FP8. Both need
+    // dst rows 8-element aligned, which the launcher checks.
+    using StoreT = std::conditional_t<sizeof(scalar_t) == 1, uint2, uint4>;
+    *reinterpret_cast<StoreT*>(dst_row + u * 8) =
+        *reinterpret_cast<const StoreT*>(out);
   }
 
   // RoPE tail: plain E4M3 * k_scale.
   for (int i = threadIdx.x; i < pe_dim; i += blockDim.x) {
     const float v =
         float(reinterpret_cast<const __nv_fp8_e4m3*>(rope)[i]) * k_scale;
-    dst_row[kv_lora_rank + i] = static_cast<scalar_t>(v);
+    dst_row[kv_lora_rank + i] = dequant_cast<scalar_t>(v);
   }
 }
 
@@ -756,18 +771,32 @@ void gather_and_dequant_cache_mla_nvfp4_dispatch(
       src_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
 
-  VLLM_STABLE_DISPATCH_HALF_TYPES(
-      dst.scalar_type(), "gather_and_dequant_cache_mla_nvfp4", [&] {
-        vllm::gather_and_dequant_cache_mla_nvfp4_kernel<scalar_t>
-            <<<grid, block, 0, stream>>>(
-                src_cache.const_data_ptr<uint8_t>(),
-                dst.mutable_data_ptr<scalar_t>(),
-                block_table.const_data_ptr<int32_t>(),
-                cu_seq_lens.const_data_ptr<int32_t>(),
-                token_to_seq.const_data_ptr<int32_t>(),
-                static_cast<int32_t>(num_tokens), scale.const_data_ptr<float>(),
-                seq_starts_ptr, block_table_stride, cache_block_stride,
-                dst_entry_stride, static_cast<int>(kv_lora_rank), pe_dim,
-                block_size);
-      });
+#define LAUNCH_GATHER_DEQUANT_MLA_NVFP4(T, DST_PTR)                        \
+  vllm::gather_and_dequant_cache_mla_nvfp4_kernel<T>                       \
+      <<<grid, block, 0, stream>>>(                                        \
+          src_cache.const_data_ptr<uint8_t>(), DST_PTR,                    \
+          block_table.const_data_ptr<int32_t>(),                           \
+          cu_seq_lens.const_data_ptr<int32_t>(),                           \
+          token_to_seq.const_data_ptr<int32_t>(),                          \
+          static_cast<int32_t>(num_tokens), scale.const_data_ptr<float>(), \
+          seq_starts_ptr, block_table_stride, cache_block_stride,          \
+          dst_entry_stride, static_cast<int>(kv_lora_rank), pe_dim,        \
+          block_size)
+
+  // An FP8 workspace pairs with an FP8 prefill query. The dequantized values
+  // stay in real units (k_scale is folded in here), matching the unscaled
+  // `.to(fp8)` the current-chunk path applies, so both halves of the online
+  // softmax merge share one scale convention.
+  if (dst.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn) {
+    LAUNCH_GATHER_DEQUANT_MLA_NVFP4(
+        __nv_fp8_e4m3,
+        reinterpret_cast<__nv_fp8_e4m3*>(dst.mutable_data_ptr()));
+  } else {
+    VLLM_STABLE_DISPATCH_HALF_TYPES(
+        dst.scalar_type(), "gather_and_dequant_cache_mla_nvfp4", [&] {
+          LAUNCH_GATHER_DEQUANT_MLA_NVFP4(scalar_t,
+                                          dst.mutable_data_ptr<scalar_t>());
+        });
+  }
+#undef LAUNCH_GATHER_DEQUANT_MLA_NVFP4
 }

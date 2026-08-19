@@ -372,9 +372,27 @@ def _get_kv_b_proj_input_dtype(
         return kv_b_proj.params_dtype
     if weight_dtype == torch.uint8:
         return None
-    if weight_dtype == current_platform.fp8_dtype() and not use_fp8_prefill:
-        return None
+    if weight_dtype == current_platform.fp8_dtype():
+        if not use_fp8_prefill:
+            return None
+        # FP8-prefill describes the attention Q/K/V tensors, not the input
+        # contract of the weight-quantized linear layer.  FP8 linear methods
+        # quantize model-dtype activations internally; passing the raw FP8 KV
+        # workspace to them makes that input quantizer reject the tensor.
+        return kv_b_proj.params_dtype
     return weight_dtype
+
+
+def _context_gather_needs_dequant(
+    workspace_dtype: torch.dtype, use_fp8_prefill: bool
+) -> bool:
+    """Whether the generic MLA gather must apply the KV-cache scale.
+
+    The raw-copy path is only valid when FP8 prefill deliberately keeps the
+    gathered cache in FP8.  If ``kv_b_proj`` requires a model-dtype workspace,
+    casting the copied FP8 values afterwards would lose the cache scale.
+    """
+    return not use_fp8_prefill or workspace_dtype != current_platform.fp8_dtype()
 
 
 class MLAAttention(nn.Module, AttentionLayerBase):
@@ -1157,6 +1175,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # fp8_ds_mla: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
+            # NVFP4 is sized by MLAAttentionSpec.state_content_size_bytes.
             state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
         )
         if self.sliding_window is not None:
@@ -2125,6 +2144,27 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         )
 
         use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        # Land gathered context in whatever dtype kv_b_proj wants for its input.
+        # When this differs from a plain FP8 cache, the gather applies k_scale
+        # while converting instead of copying raw FP8 and casting it later.
+        # An FP8 prefill query still works because only the post-kv_b_proj
+        # down-cast feeds the attention kernel.
+        #
+        # `None` means the layer takes the workspace unconverted (for example,
+        # NVFP4-packed weights), so the query dtype wins. Today's K3 checkpoint
+        # leaves self_attn unquantized, giving a bf16 workspace.
+        context_workspace_dtype: torch.dtype | None = None
+        kv_b_proj = getattr(attention_layer, "kv_b_proj", None)
+        if kv_b_proj is not None:
+            context_workspace_dtype = (
+                _get_kv_b_proj_input_dtype(
+                    kv_b_proj,
+                    self.q_data_type == current_platform.fp8_dtype(),
+                )
+                or self.q_data_type
+            )
+        elif vllm_config.cache_config.cache_dtype == "nvfp4":
+            context_workspace_dtype = self.model_config.dtype
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,
@@ -2155,7 +2195,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     self.chunked_prefill_workspace_size,
                     self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
                 ),
-                dtype=torch.bfloat16 if use_packed_fp8_cache else self.q_data_type,
+                dtype=torch.bfloat16
+                if use_packed_fp8_cache
+                else (context_workspace_dtype or self.q_data_type),
                 device=device,
             )
 
@@ -2626,15 +2668,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 )
             elif self.kv_cache_dtype == "nvfp4":
                 # The NVFP4 MLA cache needs its dedicated gather: mixed
-                # FP4-NoPE/FP8-RoPE records with block scales, dequantized
-                # to the model-dtype workspace. FP8 prefill queries would
-                # need an FP8 workspace, which this path does not produce.
-                if use_fp8_prefill:
-                    raise NotImplementedError(
-                        "kv_cache_dtype='nvfp4' with MLA does not support "
-                        "FP8 prefill query quantization; disable "
-                        "use_prefill_query_quantization."
-                    )
+                # FP4-NoPE/FP8-RoPE records with block scales, dequantized into
+                # the workspace. Because this gather always dequantizes, the
+                # workspace is allocated in kv_b_proj's input dtype rather than
+                # necessarily following q_data_type; the fp8 down-cast happens
+                # once on its (already smaller) output.
                 ops.gather_and_dequant_cache_mla_nvfp4(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
@@ -2646,7 +2684,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     scale=k_scale,
                     seq_starts=chunk.starts,
                 )
-            elif not use_fp8_prefill:
+            elif _context_gather_needs_dequant(workspace.dtype, use_fp8_prefill):
                 ops.gather_and_maybe_dequant_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
@@ -2659,7 +2697,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     seq_starts=chunk.starts,
                 )
             else:
-                # FP8 path: gather cache without dequantization
+                # FP8 path whose projection accepts the raw FP8 workspace.
                 ops.cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace[:toks],

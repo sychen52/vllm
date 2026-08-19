@@ -285,11 +285,12 @@ class BenchmarkConfig:
     torch_profile_iters: int = 3
     warmup_ms: int | None = None
 
-    # "auto" or "fp8"
+    # "auto", "fp8", or "nvfp4"
     kv_cache_dtype: str = "auto"
 
     # MLA-specific
     prefill_backend: str | None = None
+    use_prefill_query_quantization: bool = False
     kv_lora_rank: int | None = None
     qk_nope_head_dim: int | None = None
     qk_rope_head_dim: int | None = None

@@ -480,6 +480,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor slot_mapping, Tensor q_scale_inv, Tensor k_scale_inv, "
       "Tensor v_scale_inv, Tensor cache_scale_inv, int cache_block_size, "
       "Tensor? position_ids=None, Tensor? cos_sin_cache=None) -> ()");
+#ifndef USE_ROCM
+  ops.def(
+      "fused_kimi_k3_mla_qkv_quant_kv_cache_nvfp4_insert("
+      "Tensor q, Tensor k_nope, Tensor k_pe, Tensor kv_c_normed, Tensor v, "
+      "Tensor! q_fp8, Tensor! k_fp8, Tensor! v_fp8, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor q_scale_inv, Tensor k_scale_inv, "
+      "Tensor v_scale_inv, Tensor cache_scale_inv, int cache_block_size, "
+      "Tensor? position_ids=None, Tensor? cos_sin_cache=None) -> ()");
+#endif
 
   // Kimi-K3 MLA decode epilogue: concat mqa_q = [ql_nope | q_pe] and insert the
   // latent [kv_c_normed | k_pe] into the paged cache (bf16 / fp8 / fp8_ds_mla).
@@ -791,6 +800,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&fused_kimi_k3_mla_kv_concat_quant_fp8));
   ops.impl("fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert",
            TORCH_BOX(&fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert));
+#ifndef USE_ROCM
+  ops.impl("fused_kimi_k3_mla_qkv_quant_kv_cache_nvfp4_insert",
+           TORCH_BOX(&fused_kimi_k3_mla_qkv_quant_kv_cache_nvfp4_insert));
+#endif
   ops.impl("fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
            TORCH_BOX(&fused_kimi_k3_mla_decode_q_concat_kv_cache_insert));
   ops.impl("fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert",
